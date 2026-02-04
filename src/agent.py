@@ -148,12 +148,16 @@ class SelfEvolvingCodeAgent:
         
         reward = 1.0 if result['status'] == 'success' else 0.0
         
+        exec_time = result.get('execution_time', 0)
+        if not isinstance(exec_time, (int, float)):
+            exec_time = None
+        
         trajectory_id = self.trajectory_tracker.record_step(
             action="code_execution",
             action_input={"language": language, "timeout": timeout},
             observation=result.get('stdout', '')[:500],
             reward=reward,
-            execution_time=result.get('execution_time') if isinstance(result.get('execution_time'), (int, float)) else None
+            execution_time=exec_time
         )
         
         return result

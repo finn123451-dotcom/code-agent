@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.7.0
+    container_name: code-agent-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__API_GRPC_PORT=6334
+      - QDRANT__SERVICE__HTTP_PORT=6333
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:6333/dashboard"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-agent-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    command: python verify_full.py
+
+volumes:
+  qdrant_data:
