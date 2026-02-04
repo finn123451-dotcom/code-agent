@@ -1,7 +1,19 @@
-from .agent import CodeAgent
-from .code_generator import CodeGenerator
-from .code_analyzer import CodeAnalyzer
-from .code_executor import CodeExecutor
-from .file_operator import FileOperator
+from .storage import SQLiteStorage
+from .vector_store import VectorStore
+from .data_recorder import PromptRecorder, TrajectoryTracker, LatentSpaceRecorder
+from .embedding import EmbeddingEngine, HiddenStatesExtractor, DecisionVectorExtractor
+from .evolution_engine import EvolutionEngine
+from .agent import SelfEvolvingCodeAgent
 
-__all__ = ['CodeAgent', 'CodeGenerator', 'CodeAnalyzer', 'CodeExecutor', 'FileOperator']
+__all__ = [
+    'SQLiteStorage', 
+    'VectorStore',
+    'PromptRecorder', 
+    'TrajectoryTracker', 
+    'LatentSpaceRecorder',
+    'EmbeddingEngine', 
+    'HiddenStatesExtractor', 
+    'DecisionVectorExtractor',
+    'EvolutionEngine',
+    'SelfEvolvingCodeAgent'
+]
