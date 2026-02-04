@@ -153,7 +153,7 @@ class SelfEvolvingCodeAgent:
             action_input={"language": language, "timeout": timeout},
             observation=result.get('stdout', '')[:500],
             reward=reward,
-            execution_time=result.get('execution_time', 0) if isinstance(result.get('execution_time'), (int, float)) else None
+            execution_time=result.get('execution_time') if isinstance(result.get('execution_time'), (int, float)) else None
         )
         
         return result
