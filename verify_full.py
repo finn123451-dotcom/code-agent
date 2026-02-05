@@ -1,6 +1,6 @@
 """
 Complete verification script for Self-Evolving Code Agent
-Supports: in-memory mode (no external dependencies) and full mode (Qdrant + SQLite)
+Tests: Full trajectory tracking with steps, prompts, LLM requests, code executions, and latent space
 """
 import sys
 import os
@@ -8,325 +8,19 @@ import time
 import uuid
 import json
 import sqlite3
-import hashlib
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-class InMemoryVectorStore:
-    """Fallback vector store when Qdrant is not available"""
-    
-    def __init__(self):
-        self.store = {
-            "prompts": [],
-            "trajectories": [],
-            "latent": []
-        }
-    
-    def upsert_prompt_embedding(self, prompt_id, embedding, metadata):
-        self.store["prompts"].append({"id": prompt_id, "embedding": embedding, "metadata": metadata})
-    
-    def upsert_trajectory_embedding(self, trajectory_id, embedding, metadata):
-        self.store["trajectories"].append({"id": trajectory_id, "embedding": embedding, "metadata": metadata})
-    
-    def upsert_latent_embedding(self, latent_id, embedding, metadata):
-        self.store["latent"].append({"id": latent_id, "embedding": embedding, "metadata": metadata})
-    
-    def search_similar_prompts(self, query_embedding, limit=5):
-        return self._cosine_search(self.store["prompts"], query_embedding, limit)
-    
-    def search_similar_trajectories(self, query_embedding, limit=5):
-        return self._cosine_search(self.store["trajectories"], query_embedding, limit)
-    
-    def search_similar_latent(self, query_embedding, limit=5):
-        return self._cosine_search(self.store["latent"], query_embedding, limit)
-    
-    def _cosine_search(self, collection, query, limit):
-        import numpy as np
-        query = np.array(query)
-        results = []
-        for item in collection:
-            stored = np.array(item["embedding"])
-            norm_q = np.linalg.norm(query)
-            norm_s = np.linalg.norm(stored)
-            if norm_q > 0 and norm_s > 0:
-                similarity = np.dot(query, stored) / (norm_q * norm_s)
-                results.append({"id": item["id"], "score": similarity, "payload": item["metadata"]})
-        return sorted(results, key=lambda x: x["score"], reverse=True)[:limit]
-
-
-class SimpleEmbeddingEngine:
-    """Simple embedding engine with fallback"""
-    
-    def __init__(self, use_fake=True):
-        self.use_fake = use_fake
-        self.model = "text-embedding-ada-002"
-    
-    def embed_text(self, text):
-        if self.use_fake:
-            return self._fake_embedding(text)
-        try:
-            import openai
-            response = openai.Embedding.create(model=self.model, input=text)
-            return response['data'][0]['embedding']
-        except:
-            return self._fake_embedding(text)
-    
-    def embed_batch(self, texts):
-        return [self.embed_text(t) for t in texts]
-    
-    def embed_trajectory(self, trajectory_data):
-        text = self._trajectory_to_text(trajectory_data)
-        return self.embed_text(text)
-    
-    def _trajectory_to_text(self, trajectory):
-        parts = []
-        for key in ['thought', 'action', 'observation']:
-            if trajectory.get(key):
-                parts.append(f"{key}: {trajectory[key]}")
-        return " | ".join(parts) if parts else str(trajectory)
-    
-    def _fake_embedding(self, text):
-        import numpy as np
-        words = text.lower().split()
-        vec = np.zeros(1536)
-        for i, word in enumerate(words[:1536]):
-            vec[i] = hash(word) % 1000 / 1000.0
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec.tolist()
-
-
-class SimpleDecisionVectorExtractor:
-    """Simple decision vector extractor"""
-    
-    def __init__(self):
-        self.last_decision_vector = None
-    
-    def extract_decision(self, action, confidence, reasoning=None):
-        import numpy as np
-        hash_val = int(hashlib.md5(f"{action}{confidence}".encode()).hexdigest(), 16)
-        np.random.seed(hash_val % (2**32))
-        vec = np.random.randn(512)
-        vec[:10] = np.array([confidence, len(action or ""), 
-                           len(reasoning or ""), 0, 0, 0, 0, 0, 0, 0])
-        vec = vec / np.linalg.norm(vec)
-        self.last_decision_vector = vec.tolist()
-        return self.last_decision_vector
-    
-    def aggregate_decisions(self, decisions):
-        import numpy as np
-        if not decisions:
-            return np.random.randn(512).tolist()
-        return np.mean(decisions, axis=0).tolist()
-
-
-def test_storage():
-    """Test SQLiteStorage module"""
-    print("Testing SQLiteStorage...")
-    
-    db_path = ":memory:"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prompt_text TEXT NOT NULL,
-            prompt_type TEXT,
-            session_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT
-        );
-        CREATE TABLE IF NOT EXISTS trajectories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            step_order INTEGER,
-            thought TEXT,
-            action TEXT,
-            action_input TEXT,
-            observation TEXT,
-            reward REAL,
-            done BOOLEAN,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            execution_time REAL,
-            token_usage INTEGER,
-            cost REAL,
-            metadata TEXT
-        );
-        CREATE TABLE IF NOT EXISTS latent_space (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trajectory_id INTEGER,
-            embedding_vector TEXT,
-            hidden_states TEXT,
-            decision_vector TEXT,
-            agent_state TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ended_at TIMESTAMP,
-            total_tokens INTEGER DEFAULT 0,
-            total_cost REAL DEFAULT 0.0,
-            metadata TEXT
-        );
-    ''')
-    
-    session_id = str(uuid.uuid4())
-    conn.execute("INSERT INTO sessions (id, metadata) VALUES (?, ?)", (session_id, '{}'))
-    
-    cursor = conn.execute(
-        "INSERT INTO prompts (prompt_text, prompt_type, session_id, metadata) VALUES (?, ?, ?, ?)",
-        ("Test prompt", "test", session_id, '{"test": true}')
-    )
-    prompt_id = cursor.lastrowid
-    assert prompt_id > 0, "Failed to save prompt"
-    
-    cursor = conn.execute(
-        """INSERT INTO trajectories 
-           (session_id, step_order, thought, action, action_input, observation, reward, done, execution_time, token_usage, cost, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, 1, "Test thought", "test_action", '{"key": "value"}', "Test observation", 0.85, False, 0.5, 100, 0.0002, '{}')
-    )
-    traj_id = cursor.lastrowid
-    assert traj_id > 0, "Failed to save trajectory"
-    
-    import numpy as np
-    latent_vec = json.dumps([float(x) for x in np.random.randn(768)])
-    conn.execute(
-        """INSERT INTO latent_space 
-           (trajectory_id, embedding_vector, hidden_states, decision_vector, agent_state, metadata)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (traj_id, latent_vec, latent_vec, latent_vec, latent_vec, '{}')
-    )
-    
-    rows = conn.execute("SELECT * FROM prompts").fetchall()
-    assert len(rows) >= 1, "Failed to retrieve prompts"
-    
-    rows = conn.execute("SELECT * FROM trajectories WHERE session_id = ?", (session_id,)).fetchall()
-    assert len(rows) >= 1, "Failed to retrieve trajectories"
-    
-    stats = conn.execute('''
-        SELECT 
-            COUNT(*) as total_sessions,
-            SUM(total_tokens) as total_tokens,
-            SUM(total_cost) as total_cost
-        FROM sessions
-    ''').fetchone()
-    assert stats['total_sessions'] >= 1, "Failed to get session stats"
-    
-    conn.close()
-    print("  ✓ SQLiteStorage passed")
-    return True
-
-
-def test_vector_store():
-    """Test VectorStore module"""
-    print("Testing VectorStore...")
-    
-    vector_store = InMemoryVectorStore()
-    
-    vector_store.upsert_prompt_embedding(1, [0.1]*1536, {"text": "test"})
-    vector_store.upsert_trajectory_embedding(1, [0.2]*1536, {"action": "test"})
-    vector_store.upsert_latent_embedding(1, [0.3]*768, {"type": "test"})
-    
-    results = vector_store.search_similar_prompts([0.1]*1536, limit=5)
-    assert isinstance(results, list), "Search should return list"
-    assert len(results) >= 1, "Should find at least one result"
-    
-    results = vector_store.search_similar_trajectories([0.2]*1536, limit=5)
-    assert isinstance(results, list), "Search should return list"
-    
-    results = vector_store.search_similar_latent([0.3]*768, limit=5)
-    assert isinstance(results, list), "Search should return list"
-    
-    print("  ✓ VectorStore passed")
-    return True
-
-
-def test_embedding():
-    """Test EmbeddingEngine module"""
-    print("Testing EmbeddingEngine...")
-    
-    engine = SimpleEmbeddingEngine(use_fake=True)
-    
-    embedding = engine.embed_text("test prompt")
-    assert len(embedding) == 1536, f"Embedding should be 1536 dim, got {len(embedding)}"
-    
-    embeddings = engine.embed_batch(["prompt1", "prompt2"])
-    assert len(embeddings) == 2, "Batch embedding should return 2 embeddings"
-    assert len(embeddings[0]) == 1536, "Each embedding should be 1536 dim"
-    
-    trajectory_data = {"thought": "test", "action": "code_gen", "reward": 0.9}
-    embedding = engine.embed_trajectory(trajectory_data)
-    assert len(embedding) == 1536, "Trajectory embedding should be 1536 dim"
-    
-    print("  ✓ EmbeddingEngine passed")
-    return True
-
-
-def test_decision_vector():
-    """Test DecisionVectorExtractor module"""
-    print("Testing DecisionVectorExtractor...")
-    
-    extractor = SimpleDecisionVectorExtractor()
-    
-    vec = extractor.extract_decision("test_action", 0.85, "reasoning")
-    assert len(vec) == 512, f"Decision vector should be 512 dim, got {len(vec)}"
-    
-    agg = extractor.aggregate_decisions([vec, vec])
-    assert len(agg) == 512, "Aggregated vector should be 512 dim"
-    
-    print("  ✓ DecisionVectorExtractor passed")
-    return True
-
-
-def test_data_recorder():
-    """Test DataRecorder components"""
-    print("Testing DataRecorder components...")
-    
+def get_db():
     db_path = f":memory:test_{uuid.uuid4()}"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    
+    return conn
+
+
+def init_db(conn):
     conn.executescript('''
-        CREATE TABLE IF NOT EXISTS prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prompt_text TEXT NOT NULL,
-            prompt_type TEXT,
-            session_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT
-        );
-        CREATE TABLE IF NOT EXISTS trajectories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            step_order INTEGER,
-            thought TEXT,
-            action TEXT,
-            action_input TEXT,
-            observation TEXT,
-            reward REAL,
-            done BOOLEAN,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            execution_time REAL,
-            token_usage INTEGER,
-            cost REAL,
-            metadata TEXT
-        );
-        CREATE TABLE IF NOT EXISTS latent_space (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trajectory_id INTEGER,
-            embedding_vector TEXT,
-            hidden_states TEXT,
-            decision_vector TEXT,
-            agent_state TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT
-        );
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -335,259 +29,438 @@ def test_data_recorder():
             total_cost REAL DEFAULT 0.0,
             metadata TEXT
         );
-    ''')
-    
-    session_id = str(uuid.uuid4())
-    conn.execute("INSERT INTO sessions (id, metadata) VALUES (?, ?)", (session_id, '{}'))
-    
-    cursor = conn.execute(
-        "INSERT INTO prompts (prompt_text, prompt_type, session_id, metadata) VALUES (?, ?, ?, ?)",
-        ("test prompt", "test_type", session_id, '{}')
-    )
-    prompt_id = cursor.lastrowid
-    assert prompt_id > 0, "Prompt recording failed"
-    
-    cursor = conn.execute(
-        """INSERT INTO trajectories 
-           (session_id, step_order, action, action_input, observation, reward, done, execution_time, token_usage, cost, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, 1, "test", '{}', "result", 0.9, False, 0.5, 100, 0.0002, '{}')
-    )
-    traj_id = cursor.lastrowid
-    assert traj_id > 0, "Trajectory recording failed"
-    
-    import numpy as np
-    latent_vec = json.dumps([float(x) for x in np.random.randn(768)])
-    conn.execute(
-        """INSERT INTO latent_space 
-           (trajectory_id, embedding_vector, hidden_states, decision_vector, agent_state, metadata)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (traj_id, latent_vec, latent_vec, latent_vec, latent_vec, '{}')
-    )
-    
-    conn.execute("UPDATE sessions SET total_tokens = total_tokens + ?, total_cost = total_cost + ? WHERE id = ?",
-                 (100, 0.0002, session_id))
-    
-    rows = conn.execute("SELECT * FROM prompts WHERE session_id = ?", (session_id,)).fetchall()
-    assert len(rows) >= 1, "Should retrieve saved prompt"
-    
-    rows = conn.execute("SELECT * FROM trajectories WHERE session_id = ? ORDER BY step_order", (session_id,)).fetchall()
-    assert len(rows) >= 1, "Should retrieve saved trajectory"
-    
-    conn.close()
-    print("  ✓ DataRecorder components passed")
-    return True
 
-
-def test_evolution_engine():
-    """Test EvolutionEngine module"""
-    print("Testing EvolutionEngine...")
-    
-    storage = type('Storage', (), {
-        'get_trajectories': lambda self, limit=100: [
-            {'action': 'code_gen', 'reward': 0.85, 'execution_time': 0.5, 'metadata': {}},
-            {'action': 'code_gen', 'reward': 0.9, 'execution_time': 0.3, 'metadata': {}},
-            {'action': 'test', 'reward': 0.7, 'execution_time': 0.2, 'metadata': {}}
-        ],
-        'get_session_stats': lambda self: {'total_sessions': 1, 'total_tokens': 500, 'total_cost': 0.001}
-    })()
-    
-    vector_store = InMemoryVectorStore()
-    embedding_engine = SimpleEmbeddingEngine(use_fake=True)
-    
-    class EvolutionEngine:
-        def __init__(self, storage, vector_store, embedding_engine):
-            self.storage = storage
-            self.vector_store = vector_store
-            self.embedding_engine = embedding_engine
-            self.policies = []
-            self.evolution_history = []
-            self._init_default_policies()
-        
-        def _init_default_policies(self):
-            self.policies = [
-                {"name": "success_reinforce", "conditions": ["reward > 0.8"], "action": "reinforce"},
-                {"name": "failure_avoid", "conditions": ["reward < 0.2"], "action": "avoid"}
-            ]
-        
-        def analyze_patterns(self, limit=100):
-            trajectories = self.storage.get_trajectories(limit)
-            total = len(trajectories)
-            successful = sum(1 for t in trajectories if t.get('reward', 0) > 0.5)
-            return {
-                "success_rate": successful / total if total > 0 else 0,
-                "avg_reward": sum(t.get('reward', 0) for t in trajectories) / total if total > 0 else 0,
-                "avg_execution_time": sum(t.get('execution_time', 0) for t in trajectories) / total if total > 0 else 0
-            }
-        
-        def calculate_score(self):
-            patterns = self.analyze_patterns()
-            stats = self.storage.get_session_stats()
-            score = 0.4 * patterns["success_rate"]
-            score += 0.3 * min(1.0, 10.0 / max(patterns["avg_execution_time"], 0.1))
-            return {
-                "overall_score": score,
-                "success_rate": patterns["success_rate"],
-                "total_sessions": stats.get('total_sessions', 0)
-            }
-        
-        def evolve(self, trigger, context):
-            for policy in self.policies:
-                if any(c in trigger for c in policy["conditions"]):
-                    self.evolution_history.append({"policy": policy["name"], "trigger": trigger})
-                    return {"status": "evolved", "action": policy["action"]}
-            return {"status": "no_evolution"}
-        
-        def recommend(self, task_type):
-            return {
-                "recommended_actions": ["code_gen"],
-                "avg_reward": 0.85,
-                "suggested_approach": "Use code generation"
-            }
-        
-        def get_report(self):
-            return self.calculate_score()
-    
-    engine = EvolutionEngine(storage, vector_store, embedding_engine)
-    
-    patterns = engine.analyze_patterns()
-    assert "success_rate" in patterns, "Patterns should contain success_rate"
-    
-    recommendations = engine.recommend("code_generation")
-    assert "recommended_actions" in recommendations, "Should return recommendations"
-    
-    score = engine.calculate_score()
-    assert "overall_score" in score, "Score should contain overall_score"
-    
-    result = engine.evolve("reward > 0.8", {"reward": 0.9})
-    assert "status" in result, "Evolution should return status"
-    
-    print("  ✓ EvolutionEngine passed")
-    return True
-
-
-def test_integration():
-    """Test full integration"""
-    print("Testing full integration...")
-    
-    db_path = f":memory:test_{uuid.uuid4()}"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prompt_text TEXT NOT NULL,
-            prompt_type TEXT,
-            session_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata TEXT
-        );
         CREATE TABLE IF NOT EXISTS trajectories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
-            step_order INTEGER,
+            trajectory_type TEXT DEFAULT 'task',
+            task_description TEXT,
+            initial_prompt TEXT,
+            final_result TEXT,
+            done BOOLEAN DEFAULT 0,
+            total_reward REAL,
+            total_execution_time REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trajectory_id INTEGER NOT NULL,
+            step_order INTEGER NOT NULL,
+            step_name TEXT,
             thought TEXT,
             action TEXT,
             action_input TEXT,
+            action_result TEXT,
             observation TEXT,
             reward REAL,
-            done BOOLEAN,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            done BOOLEAN DEFAULT 0,
             execution_time REAL,
             token_usage INTEGER,
             cost REAL,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             metadata TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS llm_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id INTEGER,
+            trajectory_id INTEGER,
+            request_type TEXT,
+            model TEXT,
+            messages TEXT,
+            parameters TEXT,
+            prompt_text TEXT,
+            response_text TEXT,
+            response_object TEXT,
+            token_usage INTEGER,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            cost REAL,
+            latency_ms REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS prompts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trajectory_id INTEGER,
+            step_id INTEGER,
+            prompt_text TEXT NOT NULL,
+            prompt_type TEXT,
+            language TEXT,
+            context TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS code_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id INTEGER,
+            trajectory_id INTEGER,
+            code TEXT,
+            language TEXT,
+            stdout TEXT,
+            stderr TEXT,
+            return_code INTEGER,
+            execution_time REAL,
+            timeout BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS latent_space (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id INTEGER,
             trajectory_id INTEGER,
             embedding_vector TEXT,
             hidden_states TEXT,
             decision_vector TEXT,
             agent_state TEXT,
+            attention_weights TEXT,
+            intermediate_outputs TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             metadata TEXT
         );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ended_at TIMESTAMP,
-            total_tokens INTEGER DEFAULT 0,
-            total_cost REAL DEFAULT 0.0,
-            metadata TEXT
-        );
+
+        CREATE INDEX IF NOT EXISTS idx_steps_trajectory ON steps(trajectory_id);
+        CREATE INDEX IF NOT EXISTS idx_llm_requests_step ON llm_requests(step_id);
     ''')
+
+
+def serialize(obj):
+    return json.dumps(obj) if obj is not None else None
+
+
+def test_session_creation():
+    print("Testing Session Creation...")
+    conn = get_db()
+    init_db(conn)
     
     session_id = str(uuid.uuid4())
-    conn.execute("INSERT INTO sessions (id, metadata) VALUES (?, ?)", (session_id, '{}'))
-    
-    embedding_engine = SimpleEmbeddingEngine(use_fake=True)
-    vector_store = InMemoryVectorStore()
-    
-    prompt = "Write a factorial function"
-    embedding = embedding_engine.embed_text(prompt)
-    
-    cursor = conn.execute(
-        "INSERT INTO prompts (prompt_text, prompt_type, session_id, metadata) VALUES (?, ?, ?, ?)",
-        (prompt, "code_generation", session_id, '{"type": "code_generation"}')
-    )
-    prompt_id = cursor.lastrowid
-    vector_store.upsert_prompt_embedding(prompt_id, embedding, {"type": "code_generation"})
-    
-    trajectory_data = {"thought": "Generate code", "action": "code_generation", "reward": 0.85}
-    traj_embedding = embedding_engine.embed_trajectory(trajectory_data)
-    
-    cursor = conn.execute(
-        """INSERT INTO trajectories 
-           (session_id, step_order, thought, action, action_input, observation, reward, done, execution_time, token_usage, cost, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, 1, "Generate code", "code_generation", '{"prompt": "factorial"}', "Generated code", 0.85, False, 0.5, 500, 0.001, '{}')
-    )
-    traj_id = cursor.lastrowid
-    vector_store.upsert_trajectory_embedding(traj_id, traj_embedding, {"action": "code_generation"})
-    
-    import numpy as np
-    latent_vec = json.dumps([float(x) for x in np.random.randn(768)])
     conn.execute(
-        """INSERT INTO latent_space 
-           (trajectory_id, embedding_vector, hidden_states, decision_vector, agent_state, metadata)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (traj_id, latent_vec, latent_vec, latent_vec, latent_vec, '{}')
+        "INSERT INTO sessions (id, metadata) VALUES (?, ?)",
+        (session_id, '{"test": true}')
     )
     
-    similar = vector_store.search_similar_prompts(embedding, limit=5)
-    assert isinstance(similar, list), "Similar search should return list"
-    assert len(similar) >= 1, "Should find at least one similar prompt"
-    
-    rows = conn.execute("SELECT * FROM prompts").fetchall()
-    assert len(rows) >= 1, "Should retrieve saved data"
-    
-    rows = conn.execute("SELECT * FROM trajectories").fetchall()
-    assert len(rows) >= 1, "Should retrieve trajectory"
-    
-    rows = conn.execute("SELECT * FROM latent_space").fetchall()
-    assert len(rows) >= 1, "Should retrieve latent space data"
+    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    assert row is not None, "Session should be created"
+    assert row['total_tokens'] == 0, "Initial tokens should be 0"
     
     conn.close()
-    print("  ✓ Integration test passed")
+    print("  ✓ Session creation passed")
+    return True
+
+
+def test_trajectory_with_steps():
+    print("Testing Trajectory with Steps...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        """INSERT INTO trajectories (session_id, task_description, initial_prompt, trajectory_type)
+           VALUES (?, ?, ?, ?)""",
+        (session_id, "Test Task", "Generate a function", "task")
+    )
+    trajectory_id = cursor.lastrowid
+    assert trajectory_id > 0, "Trajectory should be created"
+    
+    for i in range(3):
+        conn.execute(
+            """INSERT INTO steps (trajectory_id, step_order, step_name, thought, action, action_input, observation, reward, execution_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trajectory_id, i+1, f"step_{i+1}", f"Thinking step {i+1}", "test_action", 
+             '{"key": "value"}', f"Result {i+1}", 0.8 + i*0.05, 0.1 * (i+1))
+        )
+    
+    steps = conn.execute(
+        "SELECT * FROM steps WHERE trajectory_id = ? ORDER BY step_order",
+        (trajectory_id,)
+    ).fetchall()
+    assert len(steps) == 3, f"Should have 3 steps, got {len(steps)}"
+    
+    conn.execute(
+        "UPDATE trajectories SET done = 1, total_reward = ?, total_execution_time = ? WHERE id = ?",
+        (0.9, 0.6, trajectory_id)
+    )
+    
+    trajectory = conn.execute(
+        "SELECT * FROM trajectories WHERE id = ?", (trajectory_id,)
+    ).fetchone()
+    assert trajectory['done'] == 1, "Trajectory should be marked as done"
+    
+    conn.close()
+    print("  ✓ Trajectory with steps passed")
+    return True
+
+
+def test_llm_request_recording():
+    print("Testing LLM Request Recording...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "LLM Request Test")
+    )
+    trajectory_id = cursor.lastrowid
+    
+    cursor = conn.execute(
+        "INSERT INTO steps (trajectory_id, step_order, step_name) VALUES (?, ?, ?)",
+        (trajectory_id, 1, "code_generation")
+    )
+    step_id = cursor.lastrowid
+    
+    conn.execute(
+        """INSERT INTO llm_requests 
+           (step_id, trajectory_id, request_type, model, messages, parameters, prompt_text, 
+            response_text, token_usage, prompt_tokens, completion_tokens, cost, latency_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (step_id, trajectory_id, "chat_completion", "gpt-3.5-turbo",
+         '[{"role": "user", "content": "test"}]', '{"max_tokens": 1000}',
+         "Write a function", "def test(): pass",
+         150, 50, 100, 0.0003, 150.5)
+    )
+    
+    requests = conn.execute(
+        "SELECT * FROM llm_requests WHERE step_id = ?", (step_id,)
+    ).fetchall()
+    assert len(requests) == 1, "Should have 1 LLM request"
+    assert requests[0]['token_usage'] == 150, "Token usage should be 150"
+    assert requests[0]['cost'] == 0.0003, "Cost should be 0.0003"
+    
+    conn.close()
+    print("  ✓ LLM request recording passed")
+    return True
+
+
+def test_prompt_recording():
+    print("Testing Prompt Recording...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "Prompt Test")
+    )
+    trajectory_id = cursor.lastrowid
+    
+    conn.execute(
+        """INSERT INTO prompts (trajectory_id, step_id, prompt_text, prompt_type, language, context)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (trajectory_id, None, "Write a Python function", "code_generation", "python", '{"context": "test"}')
+    )
+    
+    prompts = conn.execute("SELECT * FROM prompts WHERE trajectory_id = ?", (trajectory_id,)).fetchall()
+    assert len(prompts) == 1, "Should have 1 prompt"
+    assert prompts[0]['prompt_type'] == "code_generation", "Prompt type should be code_generation"
+    
+    conn.close()
+    print("  ✓ Prompt recording passed")
+    return True
+
+
+def test_code_execution_recording():
+    print("Testing Code Execution Recording...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "Code Execution Test")
+    )
+    trajectory_id = cursor.lastrowid
+    
+    cursor = conn.execute(
+        "INSERT INTO steps (trajectory_id, step_order, step_name) VALUES (?, ?, ?)",
+        (trajectory_id, 1, "code_execution")
+    )
+    step_id = cursor.lastrowid
+    
+    conn.execute(
+        """INSERT INTO code_executions 
+           (step_id, trajectory_id, code, language, stdout, stderr, return_code, execution_time, timeout)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (step_id, trajectory_id, "print('hello')", "python", "hello\n", "", 0, 0.05, False)
+    )
+    
+    executions = conn.execute(
+        "SELECT * FROM code_executions WHERE step_id = ?", (step_id,)
+    ).fetchall()
+    assert len(executions) == 1, "Should have 1 code execution"
+    assert executions[0]['return_code'] == 0, "Return code should be 0"
+    assert executions[0]['timeout'] == False, "Should not be timeout"
+    
+    conn.close()
+    print("  ✓ Code execution recording passed")
+    return True
+
+
+def test_latent_space_recording():
+    print("Testing Latent Space Recording...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "Latent Space Test")
+    )
+    trajectory_id = cursor.lastrowid
+    
+    cursor = conn.execute(
+        "INSERT INTO steps (trajectory_id, step_order, step_name) VALUES (?, ?, ?)",
+        (trajectory_id, 1, "test_step")
+    )
+    step_id = cursor.lastrowid
+    
+    import numpy as np
+    embedding = json.dumps([float(x) for x in np.random.randn(1536)])
+    hidden_states = json.dumps([float(x) for x in np.random.randn(768)])
+    decision_vector = json.dumps([float(x) for x in np.random.randn(512)])
+    
+    conn.execute(
+        """INSERT INTO latent_space 
+           (step_id, trajectory_id, embedding_vector, hidden_states, decision_vector, attention_weights)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (step_id, trajectory_id, embedding, hidden_states, decision_vector, '[0.1, 0.2, 0.3]')
+    )
+    
+    latent = conn.execute(
+        "SELECT * FROM latent_space WHERE step_id = ?", (step_id,)
+    ).fetchone()
+    assert latent is not None, "Latent space should be recorded"
+    
+    stored_embedding = json.loads(latent['embedding_vector'])
+    assert len(stored_embedding) == 1536, "Embedding should be 1536 dimensions"
+    
+    conn.close()
+    print("  ✓ Latent space recording passed")
+    return True
+
+
+def test_full_trajectory_retrieval():
+    print("Testing Full Trajectory Retrieval...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        """INSERT INTO trajectories (session_id, task_description, initial_prompt, done, total_reward)
+           VALUES (?, ?, ?, ?, ?)""",
+        (session_id, "Complete Test Task", "Generate and test code", 1, 0.85)
+    )
+    trajectory_id = cursor.lastrowid
+    
+    for i in range(2):
+        cursor = conn.execute(
+            """INSERT INTO steps (trajectory_id, step_order, step_name, action, reward)
+               VALUES (?, ?, ?, ?, ?)""",
+            (trajectory_id, i+1, f"step_{i+1}", f"action_{i+1}", 0.8 + i*0.1)
+        )
+        step_id = cursor.lastrowid
+        
+        conn.execute(
+            """INSERT INTO llm_requests (step_id, trajectory_id, request_type, model, token_usage)
+               VALUES (?, ?, ?, ?, ?)""",
+            (step_id, trajectory_id, "embedding", "text-embedding-ada-002", 100 + i*50)
+        )
+        
+        conn.execute(
+            """INSERT INTO code_executions (step_id, trajectory_id, language, return_code)
+               VALUES (?, ?, ?, ?)""",
+            (step_id, trajectory_id, "python", 0)
+        )
+    
+    trajectory = conn.execute(
+        "SELECT * FROM trajectories WHERE id = ?", (trajectory_id,)
+    ).fetchone()
+    assert trajectory is not None, "Trajectory should exist"
+    
+    steps = conn.execute(
+        "SELECT * FROM steps WHERE trajectory_id = ? ORDER BY step_order", (trajectory_id,)
+    ).fetchall()
+    assert len(steps) == 2, f"Should have 2 steps, got {len(steps)}"
+    
+    total_tokens = conn.execute(
+        "SELECT SUM(token_usage) FROM llm_requests WHERE trajectory_id = ?", (trajectory_id,)
+    ).fetchone()[0]
+    assert total_tokens == 300, f"Total tokens should be 300, got {total_tokens}"
+    
+    conn.close()
+    print("  ✓ Full trajectory retrieval passed")
+    return True
+
+
+def test_trajectory_relations():
+    print("Testing Trajectory Relations...")
+    conn = get_db()
+    init_db(conn)
+    
+    session_id = str(uuid.uuid4())
+    conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+    
+    cursor = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "Parent Task")
+    )
+    parent_id = cursor.lastrowid
+    
+    child_id = conn.execute(
+        "INSERT INTO trajectories (session_id, task_description) VALUES (?, ?)",
+        (session_id, "Child Task")
+    ).lastrowid
+    
+    conn.execute(
+        "INSERT INTO trajectory_relations (parent_trajectory_id, child_trajectory_id, relation_type) VALUES (?, ?, ?)",
+        (parent_id, child_id, "subtask")
+    )
+    
+    relations = conn.execute(
+        """SELECT t.* FROM trajectories t
+           JOIN trajectory_relations tr ON t.id = tr.child_trajectory_id
+           WHERE tr.parent_trajectory_id = ?""",
+        (parent_id,)
+    ).fetchall()
+    assert len(relations) == 1, "Should have 1 child trajectory"
+    
+    conn.close()
+    print("  ✓ Trajectory relations passed")
     return True
 
 
 def run_all_tests():
-    """Run all verification tests"""
     print("\n" + "="*60)
-    print("Self-Evolving Code Agent - Full Verification")
+    print("Self-Evolving Code Agent - Full Trajectory Verification")
     print("="*60 + "\n")
     
     tests = [
-        ("SQLiteStorage", test_storage),
-        ("VectorStore", test_vector_store),
-        ("EmbeddingEngine", test_embedding),
-        ("DecisionVectorExtractor", test_decision_vector),
-        ("DataRecorder", test_data_recorder),
-        ("EvolutionEngine", test_evolution_engine),
-        ("Integration", test_integration),
+        ("Session Creation", test_session_creation),
+        ("Trajectory with Steps", test_trajectory_with_steps),
+        ("LLM Request Recording", test_llm_request_recording),
+        ("Prompt Recording", test_prompt_recording),
+        ("Code Execution Recording", test_code_execution_recording),
+        ("Latent Space Recording", test_latent_space_recording),
+        ("Full Trajectory Retrieval", test_full_trajectory_retrieval),
+        ("Trajectory Relations", test_trajectory_relations),
     ]
     
     passed = 0
