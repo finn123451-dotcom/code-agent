@@ -1,3 +1,3 @@
-from .trajectory_summarizer import TrajectorySummarizer, StepSummarizer, TrajectorySummary, StepSummary
+from .clustering import TrajectoryClusterer, StrategyRecommender, Cluster, ClusterStats
 
-__all__ = ['TrajectorySummarizer', 'StepSummarizer', 'TrajectorySummary', 'StepSummary']
+__all__ = ['TrajectoryClusterer', 'StrategyRecommender', 'Cluster', 'ClusterStats']
